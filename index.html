@@ -1,0 +1,517 @@
+# --- BOT ANALISTA DE NOTICIAS V16.4 (RESCATE DE MEP/CCL Y RP SCRAPER ROBUSTO) ---
+
+import pandas as pd
+import re
+import requests
+import smtplib
+import csv
+import os
+import io
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
+from email.header import Header
+from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
+import matplotlib.pyplot as plt
+from pysentimiento import create_analyzer
+
+# ============================
+# 🎨 BRANDING & CONFIGURACIÓN
+# ============================
+COLOR_PRIMARY = "#0284c7" # Sky Blue
+COLOR_DARK = "#1f2937"    # Gris oscuro
+BG_COLOR = "#f6f8fb"      # Fondo general
+BORDER_COLOR = "#e6edf3"  # Gris borde
+HISTORIAL_CSV = 'historial_analisis.csv'
+
+
+# ============================
+# ⚙️ MÓDULOS DE UTILIDAD Y METRICAS
+# ============================
+sentiment_analyzer = create_analyzer(task="sentiment", lang="es")
+def hoy_str():
+    return datetime.now().strftime("%d/%m/%Y")
+
+def fmt_price(val):
+    if val is None or not isinstance(val, (int, float)): return "N/D"
+    return f"${val:,.2f}".replace(',', '#').replace('.', ',').replace('#', '.')
+
+# --- NUEVA FUNCIÓN: Scrapeo MEP/CCL (Fallback) ---
+def scrape_mep_ccl_ambito():
+    print("Intentando Scrapear MEP/CCL de Ámbito como FALLBACK...")
+    mep, ccl = None, None
+    try:
+        url = "https://www.ambito.com/"
+        r = requests.get(url, timeout=4, headers={"User-Agent": "Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, "html.parser")
+        
+        # Buscar el panel de cotizaciones
+        cotiz_panel = soup.find('div', class_='module-dolar-panel')
+        if cotiz_panel:
+            for item in cotiz_panel.find_all('div', class_='item'):
+                name = item.find('span', class_='name').text if item.find('span', class_='name') else ''
+                value_str = item.find('span', class_='value').text if item.find('span', class_='value') else ''
+                
+                if not value_str: continue
+                value = float(value_str.replace('.', '').replace(',', '.'))
+                
+                if 'MEP' in name:
+                    mep = value
+                elif 'CCL' in name:
+                    ccl = value
+        
+        if mep and ccl:
+            print(f"✅ Scrapeo MEP/CCL exitoso: MEP={mep}, CCL={ccl}")
+            return mep, ccl
+        else:
+            print("Advertencia: No se encontraron MEP/CCL en el panel de Ámbito.")
+            return None, None
+            
+    except Exception as e:
+        print(f"Error en Scrapeo MEP/CCL: {e}")
+        return None, None
+
+# --- FUNCIÓN: Scrapeo Riesgo País (RP) ---
+def scrape_riesgo_pais():
+    print("Scrapeando Riesgo País...")
+    try:
+        # Intenta obtener el valor de la fuente principal
+        url = "https://www.ambito.com/contenidos/mercados.html"
+        r = requests.get(url, timeout=5, headers={"User-Agent":"Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, "html.parser")
+        
+        rp_container = soup.find('a', {'href': lambda x: x and '/riesgo-pais' in x})
+        if rp_container:
+            value_str = rp_container.find('h4')
+            if value_str:
+                rp_value = value_str.text.strip().replace('.', '').replace(',', '.')
+                return float(rp_value)
+        
+        return 1350.0 # Fallback si falla el scrapeo
+    except Exception as e:
+        print(f"Error scrape Riesgo País: {e}")
+        return 1350.0
+
+def obtener_metricas_macro():
+    rp = scrape_riesgo_pais()
+    
+    # Asumimos valores fijos para Inflación/Tasa, que se actualizan una vez al mes/trimestre
+    return [
+        {"Name": "Riesgo País (Ps.)", "Value": int(rp), "ChangePct": -1.2, "Icon": "📉"},
+        {"Name": "Inflación Mensual (Ej.)", "Value": 4.2, "ChangePct": -0.5, "Icon": "🔥"},
+        {"Name": "Tasa BCRA (LELIQ/Pase)", "Value": 40.0, "ChangePct": 0.0, "Icon": "🏛️"}
+    ]
+
+def obtener_eventos_clave():
+    # Se mantiene la función de eventos clave
+    hoy = datetime.now()
+    eventos = []
+    
+    if hoy.day in [10, 11, 12]:
+        eventos.append({"Date": "Esta Semana", "Event": "📊 IPC Nacional (Inflación)", "Impact": "CRÍTICO"})
+    if hoy.weekday() == 2:
+        eventos.append({"Date": "Hoy", "Event": "🗣️ Discurso Ministro/BCRA", "Impact": "ALTO"})
+    
+    eventos.append({"Date": "Próx. Días", "Event": "🏛️ Debate Ley Bases / Pacto de Mayo", "Impact": "CRÍTICO"})
+    eventos.append({"Date": "Permanente", "Event": "🏦 Deuda: Roll Over de Leliqs y Bonos", "Impact": "MEDIO"})
+
+    return eventos
+
+# ---------------- 1) COTIZACIONES (Multi-API + Robustez) ----------------
+
+def obtener_cotizaciones():
+    cotizaciones = {"MEP": None, "CCL": None} # Inicializar para asegurar el fallback
+    
+    # 1. Bluelytics (Blue/Oficial)
+    try:
+        data_blue = requests.get("https://api.bluelytics.com.ar/v2/latest", timeout=3).json()
+        cotizaciones["Blue"] = data_blue.get("blue", {}).get("value_sell")
+        cotizaciones["Oficial"] = data_blue.get("oficial", {}).get("value_sell")
+    except Exception as e:
+        print(f"Error Bluelytics: {e}")
+    
+    # 2. DolarAPI (Financieros)
+    try:
+        response_dolar = requests.get("https://www.dolarapi.com/v1/dolares", timeout=3)
+        response_dolar.raise_for_status()
+        data_dolar = response_dolar.json()
+        
+        for item in data_dolar:
+            if item['casa'] == 'bolsa': cotizaciones['MEP'] = item['venta']
+            elif item['casa'] == 'contado_con_liqui': cotizaciones['CCL'] = item['venta']
+        
+        print("✅ Cotizaciones combinadas obtenidas.")
+    except Exception as e:
+        print(f"Error DolarAPI: {e}. Activando Scraper MEP/CCL.")
+        # FALLBACK 3: Scrapeo de MEP/CCL si la API principal falló
+        mep_scraped, ccl_scraped = scrape_mep_ccl_ambito()
+        cotizaciones['MEP'] = mep_scraped
+        cotizaciones['CCL'] = ccl_scraped
+
+    return cotizaciones
+
+def obtener_evolucion_7d(cotizaciones_actuales):
+    """Obtiene el histórico Blue/Oficial de Bluelytics para el gráfico."""
+    fechas, blue_vals, of_vals = [], [], []
+    
+    try:
+        ev = requests.get("https://api.bluelytics.com.ar/v2/evolution.json", timeout=10).json()
+        registros = ev if isinstance(ev, list) else []
+        if not registros: raise ValueError("No hay evolución")
+        
+        last_dates = {}
+        for r in registros[-60:]: 
+            dt_str = r.get("created_at", "")[:10]
+            b = r.get("blue", {})
+            o = r.get("oficial", {})
+            if not dt_str: continue
+            if dt_str not in last_dates: last_dates[dt_str] = {"blue": [], "of": []}
+            
+            if isinstance(b, dict):
+                vb = [v for k, v in b.items() if k.startswith("value") and v is not None]
+                if vb: last_dates[dt_str]["blue"].append(sum(vb) / len(vb))
+            if isinstance(o, dict):
+                vo = [v for k, v in o.items() if k.startswith("value") and v is not None]
+                if vo: last_dates[dt_str]["of"].append(sum(vo) / len(vo))
+        
+        sorted_days = sorted(list(last_dates.keys()))[-7:]
+        
+        for d in sorted_days:
+            fechas.append(datetime.strptime(d, "%Y-%m-%d").strftime("%m/%d"))
+            b_list = last_dates[d]["blue"]
+            o_list = last_dates[d]["of"]
+            blue_vals.append(sum(b_list)/len(b_list) if b_list else None)
+            of_vals.append(sum(o_list)/len(o_list) if o_list else None)
+
+    except Exception as e:
+        print(f"Error obtener_evolucion_7d: {e}. Usando FALLBACK estático.")
+    
+    # FALLBACK y limpieza de Nones
+    if len(fechas) < 7:
+        last_blue = cotizaciones_actuales.get("Blue", 0) or 1
+        last_of = cotizaciones_actuales.get("Oficial", 0) or 1
+        
+        while len(fechas) < 7:
+            date_fill = (datetime.now() - timedelta(days=7 - len(fechas))).strftime("%m/%d")
+            fechas.insert(0, date_fill)
+            blue_vals.insert(0, last_blue)
+            of_vals.insert(0, last_of)
+            
+    for i in range(len(blue_vals)):
+        if blue_vals[i] is None: blue_vals[i] = blue_vals[i-1] if i > 0 else cotizaciones_actuales.get("Blue", 1)
+        if of_vals[i] is None: of_vals[i] = of_vals[i-1] if i > 0 else cotizaciones_actuales.get("Oficial", 1)
+
+    return fechas, blue_vals, of_vals
+
+# ---------------- 2) NOTICIAS y SENTIMIENTO ----------------
+
+def noticias_newsapi(q='"dolar" OR "economia argentina" OR "riesgo pais" OR "fmi" OR "milei" OR "inflacion"'): # PALABRAS CLAVE AMPLIADAS
+    """Obtiene noticias de la API de NewsAPI."""
+    try:
+        fecha_desde = (datetime.now() - timedelta(hours=36)).strftime('%Y-%m-%dT%H:%M:%S')
+        FUENTES = "ambito.com,lanacion.com.ar,clarin.com,infobae.com"
+        URL = (f"https://newsapi.org/v2/everything?q={requests.utils.quote(q)}&domains={FUENTES}&language=es&from={fecha_desde}&sortBy=publishedAt&pageSize=25&apiKey={NEWS_API_KEY}") 
+        response = requests.get(URL, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        return [{'title': a['title'], 'source': {'name': a['source']['name']}, 'url': a['url']} for a in data['articles'] if a['title'] and "[Removed]" not in a['title']]
+    except Exception as e:
+        print(f"Error NewsAPI: {e}")
+        return []
+
+def scrape_ambito():
+    try:
+        url = "https://www.ambito.com/contenidos/mercados.html"
+        r = requests.get(url, timeout=5, headers={"User-Agent":"Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, "html.parser")
+        items = []
+        for a in soup.select("article a[title]")[:8]: 
+            items.append({"title": a.get("title"), "source": {"name":"Ámbito Financiero"}, "url": a.get("href")})
+        return items
+    except Exception as e:
+        print("Error scrape Ambito:", e)
+        return []
+
+def scrape_lanacion_economia():
+    try:
+        url = "https://www.lanacion.com.ar/economia/"
+        r = requests.get(url, timeout=5, headers={"User-Agent":"Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, "html.parser")
+        items = []
+        for tag in soup.find_all(["h2","h3"], limit=8): 
+            a = tag.find("a")
+            if a and a.text.strip():
+                href = a.get("href")
+                url_full = href if href and href.startswith("http") else f"https://www.lanacion.com.ar{href}" if href else "#"
+                items.append({"title": a.text.strip(), "source": {"name":"La Nación"}, "url": url_full})
+        return items
+    except Exception as e:
+        print("Error scrape La Nacion:", e)
+        return []
+
+def recopilar_noticias():
+    lista = []
+    seen = set()
+    for fn in (noticias_newsapi, scrape_ambito, scrape_lanacion_economia):
+        try:
+            for a in fn():
+                t = (a.get("title") or "").strip()
+                if not t or t in seen: continue
+                seen.add(t)
+                lista.append(a)
+        except: pass
+    return lista[:20] 
+
+def analizar_sentimiento(noticias):
+    df_articulos = pd.DataFrame(noticias)
+    df_articulos.drop_duplicates(subset='title', inplace=True)
+    
+    if df_articulos.empty:
+        return 0.0, df_articulos
+    
+    df_articulos['score'] = df_articulos['title'].apply(lambda t: sentiment_analyzer.predict(t).probas['POS'] - sentiment_analyzer.predict(t).probas['NEG'])
+    
+    score_noticias = df_articulos['score'].mean()
+    return score_noticias, df_articulos
+
+# ---------------- 3) GRAFICO y HTML (Lógica principal) ----------------
+
+def crear_grafico_bytes(fechas, blue_vals, of_vals):
+    if not blue_vals or len(blue_vals) < 2: return None
+    
+    max_val = max(max(blue_vals), max(of_vals))
+    min_val = min(min(blue_vals), min(of_vals))
+    
+    plt.style.use("seaborn-v0_8-whitegrid")
+    fig, ax = plt.subplots(figsize=(8,3.2))
+    
+    ax.plot(fechas, blue_vals, marker="o", linewidth=2, label="Blue", color='#2563eb')
+    ax.plot(fechas, of_vals, marker="o", linewidth=2, label="Oficial", color='#f59e0b')
+    
+    ax.set_title("Dólar Blue vs Oficial (últimos 7 días)", fontsize=13, fontweight='bold', pad=10)
+    ax.set_ylabel("ARS")
+    
+    if max_val - min_val < 5 and max_val > 0:
+        ax.set_ylim(min_val - 1, max_val + 1)
+        
+    ax.legend(frameon=False, fontsize=9, loc='lower right')
+    plt.xticks(rotation=45, fontsize=8)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=120)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+def generar_analisis_predictivo(score, rp_value):
+    # Condición de tendencia y fundamento
+    if score > 0.15:
+        tendencia = "BAJA"
+        fundamento = f"El sentimiento promedio de las noticias es marcadamente **positivo** ({score:.2f}), sugiriendo un clima de **confianza y reducción del riesgo**. Es probable que la demanda de dólares se modere."
+    elif score < -0.15:
+        tendencia = "SUBA"
+        fundamento = f"El sentimiento promedio de las noticias es marcadamente **negativo** ({score:.2f}), indicando **tensiones, incertidumbre y temor**. Esto históricamente impulsa la demanda de refugio en el dólar."
+    else:
+        tendencia = "NEUTRA"
+        fundamento = f"El sentimiento promedio de las noticias es neutral ({score:.2f}). Se espera un **mercado lateral** hasta la publicación de datos clave como la inflación o el riesgo país."
+
+    # Aumentar la coherencia con el Riesgo País
+    if rp_value > 1500 and tendencia != "SUBA":
+        fundamento += f" Advertencia: El Riesgo País ({int(rp_value)} Ps.) sigue en niveles altos, lo que añade presión alcista subyacente a la tendencia."
+    elif rp_value < 1000 and tendencia != "BAJA":
+        fundamento += f" Nota: El Riesgo País ({int(rp_value)} Ps.) muestra una mejora, soportando un potencial escenario de baja volatilidad."
+
+
+    confianza = 50 + (abs(score) * 50) 
+    
+    tags = [f"Confianza: {confianza:.0f}%", f"Score IA: {score:.2f}"]
+    if tendencia == "SUBA": tags.append("🚨 ALERTA_RIESGO")
+    elif tendencia == "BAJA": tags.append("🟢 OPTIMISMO")
+
+    return tendencia, fundamento, ", ".join(tags)
+
+def generar_html_completo(cotizaciones, tendencia, fundamento, tags, df_noticias, img_bytes, metricas_macro):
+    
+    # ... (rest of the metric functions and macro_html generation) ...
+    
+    # --- Tiles de Cotizaciones (Emojis y Fallback) ---
+    TICKERS_DOLAR = [
+        {"Name": "💵 Dólar Blue", "Price": cotizaciones.get("Blue"), "Change": 0.0, "Icon": "💵"},
+        {"Name": "🏦 Dólar MEP", "Price": cotizaciones.get("MEP"), "Change": 0.0, "Icon": "🏦"},
+        {"Name": "💱 Dólar CCL", "Price": cotizaciones.get("CCL"), "Change": 0.0, "Icon": "💱"},
+        {"Name": "🇦🇷 Oficial", "Price": cotizaciones.get("Oficial"), "Change": 0.0, "Icon": "🇦🇷"},
+    ]
+    
+    grid_html = ""
+    for item in TICKERS_DOLAR:
+        price = item['Price']
+        cotiz_html = f"""
+        <td style="width:25%; padding:6px;">
+            <div class="tile-box" style="background:#fff; border-radius:10px; padding:10px; text-align:center; border:1px solid #eef2f7;">
+                <div style="font-size:20px; margin-bottom:4px;">{item['Icon']}</div>
+                <div style="font-size:10px; color:#64748b; font-weight:bold;">{item['Name']}</div>
+                <div style="font-size:16px; font-weight:800; color:{COLOR_DARK}; margin:2px 0;">{fmt_price(price)}</div>
+            </div>
+        </td>
+        """
+        grid_html += cotiz_html
+    grid_html = f"<tr>{grid_html}</tr>"
+
+    # --- Métricas Macro ---
+    macro_html = "".join([f"""
+        <div style="display:flex; justify-content:space-between; padding: 6px 0; border-bottom: 1px dotted #eef2f7;">
+            <span style="font-size:13px; color:#334155;">{m['Icon']} {m['Name']}</span>
+            <span style="font-size:13px; font-weight:bold; color:{'#10b981' if m['ChangePct'] <= 0 else '#ef4444'};">
+                {m['Value']}{'%' if '%' in m['Name'] else ''} 
+            </span>
+        </div>""" for m in metricas_macro])
+    
+    # --- Calendario de Eventos ---
+    eventos_clave = obtener_eventos_clave()
+    calendar_html = "".join([f"""
+        <div class="event-item" style="padding: 8px 0; border-bottom:1px dashed {BORDER_COLOR}; display:flex; justify-content:space-between;">
+            <span style="font-size:13px; color:#334155; font-weight:500;">{event['Event']}</span>
+            <span style="font-size:10px; color:{'#ef4444' if event['Impact'] in ['CRÍTICO', 'ALTO'] else '#f59e0b'}; 
+                        background:{'#fef2f2' if event['Impact'] in ['CRÍTICO', 'ALTO'] else '#fffbeb'}; 
+                        padding:2px 6px; border-radius:4px; font-weight:bold;">{event['Impact']}</span>
+        </div>""" for event in eventos_clave])
+        
+    # --- Noticias y Scores ---
+    titulares_html = ''.join([f"""
+        <div class="news-item" style="padding:10px; margin-bottom:8px; border-radius:8px; background:#ffffff; border:1px solid #eef2f7; display:flex; justify-content:space-between;">
+            <div style="flex:1;">
+                <div style="font-size:10px; color:{COLOR_PRIMARY}; font-weight:bold;">{row['source'].get('name', 'N/D').upper()}</div>
+                <div style="font-size:13px; color:#374151;">{row['title'].replace('\n',' ').strip()}</div>
+                <div style="font-size:12px; margin-top:6px;"><a href="{row.get('url','#')}" style="color:#0284c7;">Leer artículo</a></div>
+            </div>
+            <div style="width:60px; text-align:right; padding-left:10px;">
+                 <span style="font-size:12px; color:#475569; font-weight:bold;">Score IA: {row['score']:.2f}</span>
+            </div>
+        </div>""" for index, row in df_noticias.sort_values('score', ascending=False).head(10).iterrows()])
+
+    fecha = hoy_str()
+    html = f"""
+    <html>
+    <head>
+        <style>
+            body {{ font-family: Helvetica, Arial, sans-serif; background-color: {BG_COLOR}; margin:0; padding:0; }}
+            .container {{ max-width: 700px; margin: 30px auto; background-color: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }}
+            
+            /* ESTILOS HOVER */
+            .tile-box:hover {{
+                border-color: {COLOR_PRIMARY} !important;
+                box-shadow: 0 4px 10px rgba(2, 132, 199, 0.2) !important;
+            }}
+            .news-item:hover {{
+                border-color: {COLOR_PRIMARY} !important;
+                box-shadow: 0 4px 8px rgba(0, 0, 0, 0.08) !important;
+                background: #fcfcfc !important; 
+                transform: translateY(-1px);
+            }}
+            /* Asegurar que los estilos se apliquen a los elementos que tienen class="news-item" o class="tile-box" */
+            .news-item, .tile-box {{ transition: all 0.3s ease; }}
+        </style>
+    </head>
+    <body style="font-family:Helvetica, Arial; background:{BG_COLOR}; padding:18px;">
+    <div class="container">
+        
+        <h2 style="margin:0 0 8px 0; color:{COLOR_DARK};">📈 Dólar Daily Analysis – {fecha}</h2>
+        <p style="color:#374151; margin:0 0 20px 0; font-weight:bold;">Pronóstico: {tendencia} | Etiquetas: {tags}</p>
+
+        <table style="width:100%; border-collapse:separate; border-spacing:0 12px; margin-bottom:20px;">{grid_html}</table>
+
+        <div style="padding:15px; border-radius:10px; background:#eff6ff; border-left:4px solid #1e40af; margin-bottom:20px;">
+            <h3 style="margin:0 0 8px 0; color:#1e40af; font-size:15px;">🧠 Fundamento de la Predicción IA</h3>
+            <p style="color:#334155; font-size:14px; line-height:1.5; margin:0;">{fundamento}</p>
+        </div>
+
+        <table style="width:100%; border-collapse:collapse; margin-bottom:20px;">
+            <tr>
+                <td style="width:50%; padding-right:10px; vertical-align:top;">
+                    <h3 style="margin:0 0 10px 0; font-size:15px; color:{COLOR_DARK};">📈 Tendencia (Blue vs Oficial 7d)</h3>
+                    <img src="cid:grafico_dolar" style="width:100%; border-radius:8px; border:1px solid #eef2f7;">
+                </td>
+                <td style="width:50%; padding-left:10px; vertical-align:top;">
+                    <h3 style="margin:0 0 10px 0; font-size:15px; color:{COLOR_DARK};">📊 Indicadores Macroeconómicos</h3>
+                    <div style="background:#fff; padding:10px; border-radius:8px; border:1px solid #eef2f7;">
+                        {macro_html}
+                    </div>
+                </td>
+            </tr>
+            <tr>
+                <td colspan="2" style="padding-top:20px;">
+                    <h3 style="margin:0 0 10px 0; font-size:15px; color:{COLOR_DARK};">📅 Radar de Eventos Políticos/Económicos</h3>
+                    <div style="background:#fff; padding:10px; border-radius:8px; border:1px solid #eef2f7;">
+                        {calendar_html}
+                    </div>
+                </td>
+            </tr>
+        </table>
+        
+        <h3 style="margin:0 0 15px 0; font-size:15px; color:{COLOR_DARK};">📰 Noticias con Score de Sentimiento (Top 10)</h3>
+        {titulares_html}
+
+        <div style="color:#9aa4b2; font-size:11px; text-align:center; margin-top:20px; padding-top:10px; border-top:1px solid #eef2f7;">Bot Analista Dólar V16.4 • Reporte Profesional</div>
+    </div>
+    </body>
+    </html>
+    """
+    return html
+
+def enviar_email_html(html, image_bytes):
+    msg = MIMEMultipart("related")
+    msg["Subject"] = f"📈 Pronóstico Dólar Daily – {hoy_str()}"
+    msg["From"] = REMITENTE_EMAIL
+    msg["To"] = DESTINATARIO_EMAIL
+
+    alt = MIMEMultipart("alternative")
+    msg.attach(alt)
+    alt.attach(MIMEText(html, "html"))
+
+    if image_bytes:
+        img = MIMEImage(image_bytes)
+        img.add_header("Content-ID", "<grafico_dolar>")
+        msg.attach(img)
+
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=20)
+        server.starttls()
+        server.login(REMITENTE_EMAIL, REMITENTE_PASSWORD)
+        server.sendmail(REMITENTE_EMAIL, DESTINATARIO_EMAIL, msg.as_string())
+        server.quit()
+        print("🚀 Email enviado correctamente.")
+    except Exception as e:
+        print("Error al enviar email:", e)
+
+# ---------------- 6) MAIN ----------------
+def main():
+    print(f"--- Iniciando Fusión Dashboard V16.4 ({datetime.now().strftime('%Y-%m-%d %H:%M')}) ---")
+    
+    # 1. Cotizaciones
+    cotizaciones = obtener_cotizaciones()
+    
+    # 2. Histórico y Gráfico
+    fechas7, blue7, of7 = obtener_evolucion_7d(cotizaciones) 
+    img_bytes = crear_grafico_bytes(fechas7, blue7, of7)
+
+    # 3. Noticias y Sentimiento
+    noticias = recopilar_noticias()
+    score_noticias, df_noticias = analizar_sentimiento(noticias)
+    print(f"Score IA: {score_noticias:.2f} | Titulares analizados: {len(df_noticias)}")
+
+    # 4. Análisis Predictivo
+    metricas_macro = obtener_metricas_macro()
+    rp_value = metricas_macro[0]['Value']
+    
+    tendencia, fundamento, tags = generar_analisis_predictivo(score_noticias, rp_value)
+
+    # 5. Generar y Enviar
+    html = generar_html_completo(cotizaciones, tendencia, fundamento, tags, df_noticias, img_bytes, metricas_macro)
+
+    enviar_email_html(html, img_bytes)
+    
+    print("--- Proceso finalizado ---")
+
+if __name__ == "__main__":
+    main()
